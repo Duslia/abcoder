@@ -128,7 +128,7 @@ func main() {
 			opts.LSP = *flagLsp
 		}
 
-		lspOptions := make(map[string]string)
+		lspOptions := make(map[string]interface{})
 		if javaHome != nil {
 			lspOptions["java.home"] = *javaHome
 		}

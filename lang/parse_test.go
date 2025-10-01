@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudwego/abcoder/lang/utils"
+
 	"github.com/cloudwego/abcoder/lang/collect"
 	"github.com/cloudwego/abcoder/lang/testutils"
 	"github.com/cloudwego/abcoder/lang/uniast"
@@ -38,7 +40,7 @@ func defaultOptions(lang string) ParseOptions {
 	}
 	return ParseOptions{
 		LSP:     lsp[lang],
-		Verbose: false,
+		Verbose: true,
 		CollectOption: collect.CollectOption{
 			Language:           uniast.Language(lang),
 			LoadExternalSymbol: false,
@@ -153,5 +155,30 @@ func TestParser_NodeFieldsConsistency(t *testing.T) {
 			t.Fatalf("Unmarshal() failed: %v", err)
 		}
 		checkRepoConsistency(t, lang, &repo, testCase)
+	}
+}
+
+func TestParser_Java_Init(t *testing.T) { // Function definition for a test in Go
+	//javaTestCase := "/Users/bytedance/Documents/code/java/mybatis-3" // Variable declaration, likely a path to Java source code to be parsed
+	javaTestCase := "/Users/bytedance/Documents/code/travel-auth" // Variable declaration, likely a path to Java source code to be parsed
+
+	options := defaultOptions("java") // Calls a function to get default parsing options, specifying the language as "java"
+	options.Verbose = true            // Sets a verbose flag to false
+
+	options.LspOptions = make(map[string]interface{})
+	options.LspOptions["extendedClientCapabilities"] = map[string]interface{}{"projectImporters": make([]string, 0, 0)}
+	options.NeedConcurrent = true
+	options.CollectOption.MaxWorkers = 8
+	options.CollectOption.EnableSorting = true
+	repobytes, err := Parse(context.Background(), javaTestCase, options) // Calls the Parse function to parse the Java code. It returns a byte slice and an error.
+	if err != nil || len(repobytes) == 0 {                               // Checks if there was an error during parsing or if the resulting byte slice is empty
+		t.Fatalf("Parse() failed: %v", err) // If either condition is true, the test fails with a formatted error message
+	}
+
+	filePath := "/Users/bytedance/GolandProjects/abcoder/testdata/asts/travel-auth.json" // Commented-out file path
+	//filePath := "/Users/bytedance/GolandProjects/abcoder/testdata/asts/travel-application.json" // Defines the output file path for the parsing result
+
+	if err := utils.MustWriteFile(filePath, repobytes); err != nil { // Calls a utility function to write the parsing result to the specified file path. It checks for a returned error.
+		t.Fatalf("Failed to write output: %v", err) // If there's an error writing the file, the test fails with a formatted error message
 	}
 }

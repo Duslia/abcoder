@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -44,6 +46,11 @@ type CollectOption struct {
 	NotNeedTest        bool
 	Excludes           []string
 	LoadByPackages     bool
+	NeedConcurrent     bool
+	// 并发配置参数
+	MaxWorkers    int  // 最大工作协程数
+	EnableSorting bool // 是否启用文件大小排序
+	BufferSize    int  // 通道缓冲区大小
 }
 
 type Collector struct {
@@ -51,6 +58,15 @@ type Collector struct {
 	spec LanguageSpec
 
 	repo string
+
+	// 🆕 新增：并发处理相关字段
+	clientPool *LSPClientPool
+	mu         sync.RWMutex // 保护共享状态
+
+	// 并发配置参数
+	maxWorkers    int  // 最大工作协程数
+	enableSorting bool // 是否启用文件大小排序
+	bufferSize    int  // 通道缓冲区大小
 
 	syms map[Location]*DocumentSymbol
 
@@ -121,6 +137,69 @@ func NewCollector(repo string, cli *LSPClient) *Collector {
 	// 	ret.modPatcher = &rust.RustModulePatcher{Root: repo}
 	// }
 	return ret
+}
+
+// 🆕 新增：使用客户端池的构造函数
+func NewCollectorWithPool(repo string, pool *LSPClientPool) *Collector {
+	// 从池中获取一个客户端作为主客户端
+	if pool == nil {
+		panic("failed to acquire LSP client from pool")
+	}
+	cli := pool.Acquire()
+
+	ret := &Collector{
+		repo:       repo,
+		cli:        cli,
+		clientPool: pool,
+		spec:       switchSpec(cli.ClientOptions.Language, repo),
+
+		// 设置默认并发配置
+		maxWorkers:    4,    // 默认4个工作协程
+		enableSorting: true, // 默认启用文件大小排序
+		bufferSize:    10,   // 默认缓冲区大小为10
+
+		syms:  map[Location]*DocumentSymbol{},
+		funcs: map[*DocumentSymbol]functionInfo{},
+		deps:  map[*DocumentSymbol][]dependency{},
+		vars:  map[*DocumentSymbol]dependency{},
+		files: map[string]*uniast.File{},
+	}
+	pool.Release(cli)
+	return ret
+}
+
+// 🆕 新增：使用多个客户端的构造函数
+func NewCollectorWithMultipleClients(repo string, clients []*LSPClient) *Collector {
+	if len(clients) == 0 {
+		panic("at least one LSP client is required")
+	}
+
+	// 使用现有的 NewLSPClientPool 函数创建池
+	pool := NewLSPClientPool(clients)
+
+	return NewCollectorWithPool(repo, pool)
+}
+
+// SetConcurrencyConfig 设置并发配置参数
+func (c *Collector) SetConcurrencyConfig(maxWorkers int, enableSorting bool, bufferSize int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if maxWorkers > 0 {
+		c.maxWorkers = maxWorkers
+	}
+	c.enableSorting = enableSorting
+	if bufferSize > 0 {
+		c.bufferSize = bufferSize
+	}
+}
+
+// GetConcurrencyConfig 获取当前并发配置参数
+func (c *Collector) GetConcurrencyConfig() (maxWorkers int, enableSorting bool, bufferSize int) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.maxWorkers, c.enableSorting, c.bufferSize
 }
 
 func (c *Collector) configureLSP(ctx context.Context) {
@@ -369,6 +448,17 @@ func (c *Collector) ScannerFile(ctx context.Context) []*DocumentSymbol {
 }
 
 func (c *Collector) ScannerByTreeSitter(ctx context.Context) ([]*DocumentSymbol, error) {
+	// 如果有客户端池，使用并发处理
+	if c.clientPool != nil {
+		return c.scannerByTreeSitterConcurrent(ctx)
+	}
+
+	// 否则使用原有的单线程处理
+	return c.scannerByTreeSitterSequential(ctx)
+}
+
+// 原有的单线程处理方法
+func (c *Collector) scannerByTreeSitterSequential(ctx context.Context) ([]*DocumentSymbol, error) {
 	var modulePaths []string
 	// Java uses parsing pom method to obtain hierarchical relationships
 	if c.Language == uniast.Java {
@@ -391,6 +481,50 @@ func (c *Collector) ScannerByTreeSitter(ctx context.Context) ([]*DocumentSymbol,
 		} else {
 			excludes[i] = e
 		}
+	}
+
+	totalStartTime := time.Now()
+	fileList := make([]string, 0)
+
+	for _, modulePath := range modulePaths {
+		err := filepath.Walk(modulePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+			// 检查排除路径
+			for _, e := range excludes {
+				if strings.HasPrefix(path, e) {
+					return nil
+				}
+			}
+			if c.spec.ShouldSkip(path) {
+				return nil
+			}
+			uri := NewURI(path)
+			_, err = c.cli.DidOpen(ctx, uri)
+			if err != nil {
+				return err
+			}
+			fileList = append(fileList, path)
+			return nil
+		})
+		if err != nil {
+			log.Error("scan files failed: %v", err)
+		}
+	}
+	OpenFilesince := time.Since(totalStartTime)
+
+	searchStart := time.Now()
+	r, err := c.cli.WorkspaceSearchSymbols(ctx, "String")
+	since := time.Since(searchStart)
+	Toaltsince := time.Since(totalStartTime)
+
+	log.Info("search symbols took %v, search time %v, total %v ,nums %D", OpenFilesince, since, Toaltsince, len(r))
+	if err != nil {
+		return nil, err
 	}
 
 	scanner := func(path string, info os.FileInfo, err error) error {
@@ -431,7 +565,7 @@ func (c *Collector) ScannerByTreeSitter(ctx context.Context) ([]*DocumentSymbol,
 		if err != nil {
 			return err
 		}
-		tree, err := parser.Parse(ctx, content)
+		tree, err := parser.Parse(ctx, c.cli.P, content)
 		if err != nil {
 			log.Error("parse file %s failed: %v", path, err)
 			return nil // continue with next file
@@ -457,6 +591,466 @@ func (c *Collector) ScannerByTreeSitter(ctx context.Context) ([]*DocumentSymbol,
 		root_syms = append(root_syms, symbol)
 	}
 	return root_syms, nil
+}
+
+// 新的并发处理方法
+func (c *Collector) scannerByTreeSitterConcurrent(ctx context.Context) ([]*DocumentSymbol, error) {
+	var modulePaths []string
+	// Java uses parsing pom method to obtain hierarchical relationships
+	if c.Language == uniast.Java {
+		rootPomPath := filepath.Join(c.repo, "pom.xml")
+		rootModule, err := parser.ParseMavenProject(rootPomPath)
+		if err != nil {
+			// 尝试直接遍历文件
+			modulePaths = append(modulePaths, c.repo)
+		} else {
+			modulePaths = parser.GetModulePaths(rootModule)
+		}
+	}
+
+	// 配置排除路径
+	excludes := make([]string, len(c.Excludes))
+	for i, e := range c.Excludes {
+		if !filepath.IsAbs(e) {
+			excludes[i] = filepath.Join(c.repo, e)
+		} else {
+			excludes[i] = e
+		}
+	}
+
+	// 收集所有需要处理的文件
+	var allFiles []fileInfo
+
+	for _, modulePath := range modulePaths {
+		err := filepath.Walk(modulePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+			// 检查排除路径
+			for _, e := range excludes {
+				if strings.HasPrefix(path, e) {
+					return nil
+				}
+			}
+			if c.spec.ShouldSkip(path) {
+				return nil
+			}
+			allFiles = append(allFiles, fileInfo{
+				path: path,
+				fi:   info,
+				size: info.Size(),
+			})
+			return nil
+		})
+		if err != nil {
+			log.Error("scan files failed: %v", err)
+		}
+	}
+
+	// 按文件大小排序（大文件优先处理，提高并发效率）
+	c.sortFilesBySize(allFiles)
+
+	//// 使用基于文件大小的负载均衡分配文件
+	workerFiles := c.distributeFilesBySize(allFiles, c.maxWorkers)
+
+	// 并发处理文件
+	return c.processFilesConcurrently(ctx, workerFiles)
+}
+
+// processFilesConcurrently 并发处理文件列表
+func (c *Collector) processFilesConcurrently(ctx context.Context, fileTaskList [][]fileInfo) ([]*DocumentSymbol, error) {
+	if len(fileTaskList) == 0 {
+		return nil, nil
+	}
+	metrics := PerformanceMetrics{}
+
+	totalStartTime := time.Now()
+
+	// 确定工作协程数量
+	maxWorkers := c.maxWorkers
+	if maxWorkers <= 0 {
+		maxWorkers = 4 // 默认值
+	}
+	// 不能超过客户端池大小
+	if c.clientPool != nil && maxWorkers > c.clientPool.Size() {
+		maxWorkers = c.clientPool.Size()
+	}
+	// 不能超过文件数量
+	if maxWorkers > len(fileTaskList) {
+		maxWorkers = len(fileTaskList)
+	}
+
+	log.Info("Starting concurrent processing with %d workers", maxWorkers)
+
+	// 创建结果收集器
+	results := make([][]*tempCollectorResult, maxWorkers)
+	var wg sync.WaitGroup
+
+	// 启动worker协程，每个协程处理分配给它的文件列表
+	for workerID := 0; workerID < maxWorkers; workerID++ {
+		if len(fileTaskList[workerID]) == 0 {
+			continue // 跳过没有分配文件的worker
+		}
+
+		wg.Add(1)
+		go func(workerID int, fileList []fileInfo) {
+			defer wg.Done()
+			workerMetrics := WorkerMetrics{}
+
+			workerStartTime := time.Now()
+
+			// 获取LSP客户端（每个worker只获取一次）
+			clientAcquireStart := time.Now()
+			client := c.clientPool.Acquire()
+			if client == nil {
+				log.Error("Worker %d failed to acquire client: pool is closed", workerID)
+				return
+			}
+			defer c.clientPool.Release(client)
+			clientAcquireTime := time.Since(clientAcquireStart)
+			workerMetrics.WorkerID = workerID
+			workerMetrics.FileCount = len(fileList)
+			workerMetrics.ClientAcquireTime = clientAcquireTime
+			workerMetrics.ClientAcquireTime = clientAcquireTime
+
+			log.Info("Worker %d acquired client in %v, processing %d files", workerID, clientAcquireTime, len(fileList))
+
+			// 创建临时收集器
+			tempCollector := &Collector{
+				cli:            client,
+				spec:           c.spec,
+				repo:           c.repo,
+				syms:           make(map[Location]*DocumentSymbol),
+				funcs:          make(map[*DocumentSymbol]functionInfo),
+				deps:           make(map[*DocumentSymbol][]dependency),
+				vars:           make(map[*DocumentSymbol]dependency),
+				files:          make(map[string]*uniast.File),
+				localLSPSymbol: make(map[DocumentURI]map[Range]*DocumentSymbol),
+				localFunc:      make(map[Location]*DocumentSymbol),
+				CollectOption:  c.CollectOption,
+			}
+			// 处理分配给该worker的所有文件
+			workerResults := make([]*tempCollectorResult, 0, len(fileList))
+			for _, file := range fileList {
+
+				if ctx.Err() != nil {
+					log.Error("Worker %d stopped due to context cancellation", workerID)
+					return
+				}
+				fileMetrics := FileMetrics{}
+				result := c.processFile(ctx, tempCollector, &fileMetrics, client, file)
+				if result != nil {
+					workerResults = append(workerResults, result)
+				}
+				workerMetrics.FileMetrics = append(workerMetrics.FileMetrics, fileMetrics)
+			}
+			// 更新worker指标
+			workerTotalTime := time.Since(workerStartTime)
+			workerMetrics.TotalProcessTime = workerTotalTime
+			metrics.WorkerMetrics = append(metrics.WorkerMetrics, workerMetrics)
+			log.Info("Worker %d completed processing %d files in %v (client acquire: %v)",
+				workerID, len(fileList), workerTotalTime, clientAcquireTime)
+			// 保存结果
+			results[workerID] = workerResults
+		}(workerID, fileTaskList[workerID])
+	}
+
+	// 等待所有worker完成
+	wg.Wait()
+
+	// 合并所有结果
+	mergeStartTime := time.Now()
+	var allResults []*tempCollectorResult
+	for _, workerResults := range results {
+		allResults = append(allResults, workerResults...)
+	}
+
+	finalSymbols := c.mergeResults(allResults)
+	mergeTime := time.Since(mergeStartTime)
+
+	// 更新总体性能指标
+	totalTime := time.Since(totalStartTime)
+	metrics.TotalProcessTime = totalTime
+	metrics.MergeTime = mergeTime
+
+	log.Info("Concurrent processing completed in %v (load balancing: %v, merge: %v)",
+		totalTime, metrics.LoadBalancingTime, mergeTime)
+
+	return finalSymbols, nil
+}
+
+// tempCollectorResult 临时收集器结果
+// fileInfo 文件信息，用于排序
+type fileInfo struct {
+	path string
+	size int64
+	fi   os.FileInfo
+}
+
+type tempCollectorResult struct {
+	symbols map[Location]*DocumentSymbol
+	files   map[string]*uniast.File
+	funcs   map[*DocumentSymbol]functionInfo
+	deps    map[*DocumentSymbol][]dependency
+	vars    map[*DocumentSymbol]dependency
+}
+
+// PerformanceMetrics 性能监控指标
+type PerformanceMetrics struct {
+	FileCollectionTime time.Duration   // 文件收集耗时
+	LoadBalancingTime  time.Duration   // 负载均衡分配耗时
+	TotalProcessTime   time.Duration   // 总处理时间
+	WorkerMetrics      []WorkerMetrics // 每个worker的指标
+	MergeTime          time.Duration   // 结果合并耗时
+}
+
+// WorkerMetrics 单个worker的性能指标
+type WorkerMetrics struct {
+	WorkerID          int           // Worker ID
+	ClientAcquireTime time.Duration // 客户端获取耗时
+	TotalProcessTime  time.Duration // 总处理时间
+	FileCount         int           // 处理的文件数量
+	TotalFileSize     int64         // 处理的文件总大小
+	FileMetrics       []FileMetrics // 每个文件的处理指标
+}
+
+// FileMetrics 单个文件的处理指标
+type FileMetrics struct {
+	FilePath         string        // 文件路径
+	FileSize         int64         // 文件大小
+	ProcessTime      time.Duration // 处理耗时
+	LSPTime          time.Duration // LSP操作耗时
+	ParseTime        time.Duration // 解析耗时
+	WalkTime         time.Duration // AST遍历耗时
+	TotalProcessTime time.Duration // 总共耗时
+}
+
+// processFile 处理单个文件
+func (c *Collector) processFile(ctx context.Context, tempCollector *Collector, fm *FileMetrics, client *LSPClient, fileInfo fileInfo) *tempCollectorResult {
+	fileStartTime := time.Now()
+
+	// 处理文件
+	file := tempCollector.files[fileInfo.path]
+	if file == nil {
+		rel, err := filepath.Rel(c.repo, fileInfo.path)
+		if err != nil {
+			log.Error("failed to get relative path for %s: %v", fileInfo.path, err)
+			return nil
+		}
+		file = uniast.NewFile(rel)
+		tempCollector.files[fileInfo.path] = file
+	}
+
+	// 读取文件内容
+	readStartTime := time.Now()
+	// 解析use语句
+	content, err := os.ReadFile(fileInfo.path)
+	if err != nil {
+		return nil
+	}
+	readTime := time.Since(readStartTime)
+
+	// LSP操作：打开文件
+	lspStartTime := time.Now()
+	uri := NewURI(fileInfo.path)
+	_, err = client.DidOpen(ctx, uri)
+	if err != nil {
+		log.Error("failed to open file %s: %v", fileInfo.path, err)
+		return nil
+	}
+	lspTime := time.Since(lspStartTime)
+
+	// 解析文件
+	parseStartTime := time.Now()
+	tree, err := parser.Parse(ctx, client.P, content)
+	if err != nil {
+		log.Error("parse file %s failed: %v", fileInfo.path, err)
+		return nil
+	}
+	parseTime := time.Since(parseStartTime)
+
+	// 遍历AST
+	walkStartTime := time.Now()
+	tempCollector.walk(tree.RootNode(), uri, content, file, nil)
+	walkTime := time.Since(walkStartTime)
+
+	// 计算总处理时间
+	totalProcessTime := time.Since(fileStartTime)
+
+	// 记录详细的性能指标（可选：仅在调试模式下记录）
+	if c.CollectOption.Language != "" { // 简单的条件判断，避免过多日志
+		log.Info("File %s processed in %v (read: %v, lsp: %v, parse: %v, walk: %v, size: %d bytes)",
+			filepath.Base(fileInfo.path), totalProcessTime, readTime, lspTime, parseTime, walkTime, fileInfo.size)
+	}
+
+	fm.FilePath = fileInfo.path
+	fm.FileSize = fileInfo.size
+	fm.ProcessTime = parseTime
+	fm.LSPTime = lspTime
+	fm.ParseTime = parseTime
+	fm.WalkTime = walkTime
+	fm.TotalProcessTime = totalProcessTime
+
+	// 返回结果
+	return &tempCollectorResult{
+		symbols: tempCollector.syms,
+		files:   tempCollector.files,
+		funcs:   tempCollector.funcs,
+		deps:    tempCollector.deps,
+		vars:    tempCollector.vars,
+	}
+}
+
+// mergeResults 合并多个临时收集器的结果
+func (c *Collector) mergeResults(results []*tempCollectorResult) []*DocumentSymbol {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 统计信息
+	var totalSymbols, totalFiles, totalFuncs, totalDeps, totalVars int
+
+	// 合并所有结果到主收集器
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+
+		// 合并符号（检查冲突）
+		for loc, sym := range result.symbols {
+			if existing, exists := c.syms[loc]; exists {
+				// 如果存在冲突，保留更详细的符号信息
+				if c.isMoreDetailed(sym, existing) {
+					c.syms[loc] = sym
+				}
+			} else {
+				c.syms[loc] = sym
+			}
+			totalSymbols++
+		}
+
+		// 合并文件
+		for path, file := range result.files {
+			c.files[path] = file
+			totalFiles++
+		}
+
+		// 合并函数信息
+		for sym, info := range result.funcs {
+			c.funcs[sym] = info
+			totalFuncs++
+		}
+
+		// 合并依赖
+		for sym, deps := range result.deps {
+			c.deps[sym] = deps
+			totalDeps++
+		}
+
+		// 合并变量
+		for sym, dep := range result.vars {
+			c.vars[sym] = dep
+			totalVars++
+		}
+	}
+
+	// 记录合并统计信息
+	log.Info("Merged results: %d symbols, %d files, %d functions, %d dependencies, %d variables",
+		totalSymbols, totalFiles, totalFuncs, totalDeps, totalVars)
+
+	// 返回所有符号
+	root_syms := make([]*DocumentSymbol, 0, len(c.syms))
+	for _, symbol := range c.syms {
+		root_syms = append(root_syms, symbol)
+	}
+
+	return root_syms
+}
+
+// isMoreDetailed 判断哪个符号包含更多详细信息
+func (c *Collector) isMoreDetailed(sym1, sym2 *DocumentSymbol) bool {
+	// 比较符号的详细程度
+	score1 := c.calculateSymbolScore(sym1)
+	score2 := c.calculateSymbolScore(sym2)
+	return score1 > score2
+}
+
+// calculateSymbolScore 计算符号的详细程度分数
+func (c *Collector) calculateSymbolScore(sym *DocumentSymbol) int {
+	if sym == nil {
+		return 0
+	}
+
+	score := 0
+
+	// 基础分数
+	score += 1
+
+	// 如果有文本信息，加分
+	if sym.Text != "" {
+		score += 2
+	}
+
+	// 如果有子符号，加分
+	if len(sym.Children) > 0 {
+		score += len(sym.Children)
+	}
+
+	// 如果有范围信息，加分
+	if sym.Location.Range.Start.Line != sym.Location.Range.End.Line ||
+		sym.Location.Range.Start.Character != sym.Location.Range.End.Character {
+		score += 1
+	}
+
+	// 如果有Token信息，加分
+	if len(sym.Tokens) > 0 {
+		score += 1
+	}
+
+	return score
+}
+
+// sortFilesBySize 按文件大小排序（大文件优先）
+func (c *Collector) sortFilesBySize(files []fileInfo) {
+	// 使用简单的冒泡排序，按文件大小降序排列
+	n := len(files)
+	for i := 0; i < n-1; i++ {
+		for j := 0; j < n-i-1; j++ {
+			if files[j].size < files[j+1].size {
+				files[j], files[j+1] = files[j+1], files[j]
+			}
+		}
+	}
+}
+
+// distributeFilesBySize 基于文件大小进行负载均衡分配
+// 使用贪心算法将文件分配给不同的worker，尽量平衡每个worker的总工作量
+func (c *Collector) distributeFilesBySize(files []fileInfo, maxWorkers int) [][]fileInfo {
+
+	// 初始化worker列表
+	if maxWorkers <= 0 {
+		maxWorkers = 1
+	}
+	if maxWorkers > len(files) {
+		maxWorkers = len(files)
+	}
+	rund := len(files) / maxWorkers
+	count := 0
+	workerFiles := make([][]fileInfo, maxWorkers)
+	// 已经排序好了，就按照当前每轮最前面的就是相对较大的，每次都分配给当前轮次最大的worker
+	for i := 0; i < rund && count < len(files); i++ {
+		for j := 0; j < maxWorkers; j++ {
+			workerFiles[j] = append(workerFiles[j], files[i*maxWorkers+j])
+			count++
+		}
+	}
+
+	for i := count; i < len(files); i++ {
+		workerFiles[0] = append(workerFiles[0], files[i])
+	}
+	return workerFiles
 }
 
 // getModulePaths traverses the maven module tree and returns a flat list of module paths.

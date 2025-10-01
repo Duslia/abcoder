@@ -17,7 +17,6 @@ package parser
 import (
 	"context"
 	"log"
-	"sync"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -26,17 +25,11 @@ import (
 	"github.com/smacker/go-tree-sitter/java"
 )
 
-var (
-	once   sync.Once
-	parser *sitter.Parser
-)
-
 func NewParser() *sitter.Parser {
-	once.Do(func() {
-		parser = sitter.NewParser()
-		parser.SetLanguage(java.GetLanguage())
-	})
-	return parser
+	p := sitter.NewParser()
+	p.SetLanguage(java.GetLanguage())
+	return p
+
 }
 
 func GetLanguage(l uniast.Language) *sitter.Language {
@@ -47,8 +40,10 @@ func GetLanguage(l uniast.Language) *sitter.Language {
 	return nil
 }
 
-func Parse(ctx context.Context, content []byte) (*sitter.Tree, error) {
-	p := NewParser()
+func Parse(ctx context.Context, p *sitter.Parser, content []byte) (*sitter.Tree, error) {
+	if p == nil {
+		p = NewParser()
+	}
 	tree, err := p.ParseCtx(ctx, nil, content)
 	if err != nil {
 		log.Printf("Error parsing content: %v", err)

@@ -35,7 +35,7 @@ type DebugNode struct {
 // NewDebugTree parses the source code and builds a Go-native debug tree.
 // This function is designed to be used in testing and debugging scenarios.
 func NewDebugTree(ctx context.Context, content []byte) (*DebugNode, error) {
-	tree, err := Parse(ctx, content)
+	tree, err := Parse(ctx, NewParser(), content)
 	if err != nil {
 		return nil, err
 	}

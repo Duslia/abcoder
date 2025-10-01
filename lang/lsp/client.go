@@ -23,10 +23,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/cloudwego/abcoder/lang/java/parser"
 	"github.com/cloudwego/abcoder/lang/log"
 	"github.com/cloudwego/abcoder/lang/uniast"
+	sitter "github.com/smacker/go-tree-sitter"
 	lsp "github.com/sourcegraph/go-lsp"
 	"github.com/sourcegraph/jsonrpc2"
 )
@@ -37,9 +40,14 @@ type LSPClient struct {
 	tokenTypes             []string
 	tokenModifiers         []string
 	hasSemanticTokensRange bool
-	files                  map[DocumentURI]*TextDocumentItem
-	provider               LanguageServiceProvider
+
+	// 🆕 新增：保护内部缓存
+	filesMu  sync.RWMutex
+	files    map[DocumentURI]*TextDocumentItem
+	provider LanguageServiceProvider
 	ClientOptions
+
+	P *sitter.Parser
 }
 
 type ClientOptions struct {
@@ -75,7 +83,7 @@ func NewLSPClient(repo string, openfile string, wait time.Duration, opts ClientO
 	}
 
 	time.Sleep(wait)
-
+	cli.P = parser.NewParser()
 	return cli, nil
 }
 

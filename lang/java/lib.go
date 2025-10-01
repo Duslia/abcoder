@@ -179,11 +179,11 @@ func setupJDTLS() (string, error) {
 	return jdtlsDir, nil
 }
 
-func GetDefaultLSP(LspOptions map[string]string) (lang uniast.Language, name string) {
+func GetDefaultLSP(LspOptions map[string]interface{}) (lang uniast.Language, name string) {
 	return uniast.Java, generateExecuteCmd(LspOptions)
 }
 
-func generateExecuteCmd(LspOptions map[string]string) string {
+func generateExecuteCmd(LspOptions map[string]interface{}) string {
 	var jdtRootPATH string
 	// First, check environment variable
 	if envPath := os.Getenv("JDTLS_ROOT_PATH"); len(envPath) != 0 {
@@ -233,19 +233,28 @@ func generateExecuteCmd(LspOptions map[string]string) string {
 		"-Declipse.application=org.eclipse.jdt.ls.core.id1",
 		"-Dosgi.bundles.defaultStartLevel=4",
 		"-Declipse.product=org.eclipse.jdt.ls.core.product",
-		"-Dlog.level=ALL",
+		"-Dlog.level=ERROR",
 		"-noverify",
-		"-Xmx1G",
+		"-XX:+PerfDisableSharedMem -XX:+AlwaysPreTouch",
+		"-Xmx4G -Xms2G -XX:MaxMetaspaceSize=1G",
+		"-XX:+UseG1GC -XX:MaxGCPauseMillis=200",
+		"-Djdt.core.index.enabled=true",
+		"-Djdt.core.index.threadCount=2",
+		"-Djdt.core.reconcile.enabled=false",
 		fmt.Sprintf("-jar %s", jdtLsPath),
 		fmt.Sprintf("-configuration %s", configPath),
 		fmt.Sprintf("-data %s", dataPath),
 		"--add-modules=ALL-SYSTEM",
 		"--add-opens java.base/java.util=ALL-UNNAMED",
 		"--add-opens java.base/java.lang=ALL-UNNAMED",
+		"--add-opens java.base/java.lang.invoke=ALL-UNNAMED",
+		"--add-opens java.base/java.lang.ref=ALL-UNNAMED",
+		"--add-opens java.base/java.lang.reflect=ALL-UNNAMED",
 	}
 	javaCmd := "java "
-	if len(LspOptions["java.home"]) != 0 {
-		javaCmd = LspOptions["java.home"] + " "
+
+	if LspOptions["java.home"] != nil && len(LspOptions["java.home"].(string)) != 0 {
+		javaCmd = LspOptions["java.home"].(string) + " "
 	}
 	return javaCmd + strings.Join(args, " ")
 }

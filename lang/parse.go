@@ -20,11 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/cloudwego/abcoder/lang/register"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/cloudwego/abcoder/lang/register"
 
 	"github.com/cloudwego/abcoder/lang/collect"
 	"github.com/cloudwego/abcoder/lang/cxx"
@@ -47,7 +48,7 @@ type ParseOptions struct {
 	// specify the repo id
 	RepoID string
 
-	LspOptions map[string]string
+	LspOptions map[string]interface{}
 
 	// TS options
 	// tsconfig string
@@ -93,7 +94,7 @@ func Parse(ctx context.Context, uri string, args ParseOptions) ([]byte, error) {
 		log.Info("end initialize LSP server")
 	}
 
-	repo, err := collectSymbol(ctx, client, uri, args.CollectOption)
+	repo, err := collectSymbol(ctx, client, uri, args)
 	if err != nil {
 		log.Error("Failed to collect symbols: %v\n", err)
 		return nil, err
@@ -174,14 +175,73 @@ func checkLSP(language uniast.Language, lspPath string, args ParseOptions) (l un
 	return
 }
 
-func collectSymbol(ctx context.Context, cli *lsp.LSPClient, repoPath string, opts collect.CollectOption) (repo *uniast.Repository, err error) {
+func generateLspClients(uri string, args ParseOptions, client *lsp.LSPClient) ([]*lsp.LSPClient, error) {
+	if !filepath.IsAbs(uri) {
+		uri, _ = filepath.Abs(uri)
+	}
+	l, lspPath, err := checkLSP(args.Language, args.LSP, args)
+	if err != nil {
+		return nil, err
+	}
+	openfile, opentime, err := checkRepoPath(uri, l)
+	if err != nil {
+		return nil, err
+	}
+
+	var clients []*lsp.LSPClient
+	clientNumber := args.MaxWorkers
+	if client != nil {
+		clients = append(clients, client)
+		clientNumber -= 1
+	}
+
+	if lspPath != "" {
+		for i := 0; i < clientNumber; i++ {
+			// Initialize the LSP client
+			log.Info("start initialize LSP server %s...\n", lspPath)
+			register.RegisterProviders()
+			cli, err := lsp.NewLSPClient(uri, openfile, opentime, lsp.ClientOptions{
+				Server:                lspPath,
+				Language:              l,
+				Verbose:               args.Verbose,
+				InitializationOptions: args.LspOptions,
+			})
+			if err != nil {
+				log.Error("failed to initialize LSP server: %v\n", err)
+				return nil, err
+			}
+			log.Info("end initialize LSP server")
+			clients = append(clients, cli)
+		}
+	}
+
+	return clients, nil
+}
+func collectSymbol(ctx context.Context, cli *lsp.LSPClient, repoPath string, args ParseOptions) (repo *uniast.Repository, err error) {
+	opts := args.CollectOption
 	if opts.Language == uniast.Golang {
 		repo, err = callGoParser(ctx, repoPath, opts)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		collector := collect.NewCollector(repoPath, cli)
+		var collector *collect.Collector
+		if opts.NeedConcurrent {
+			clients, err := generateLspClients(repoPath, args, cli)
+			if err != nil {
+				return nil, err
+			}
+			// 创建多个LSP客户端
+			defer func() {
+				for _, client := range clients {
+					client.Close()
+				}
+			}()
+			collector = collect.NewCollectorWithMultipleClients(repoPath, clients)
+			collector.SetConcurrencyConfig(opts.MaxWorkers, opts.EnableSorting, opts.BufferSize)
+		} else {
+			collector = collect.NewCollector(repoPath, cli)
+		}
 		collector.CollectOption = opts
 		log.Info("start collecting symbols...\n")
 		err = collector.Collect(ctx)

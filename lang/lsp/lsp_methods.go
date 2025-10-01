@@ -39,9 +39,14 @@ type DidOpenTextDocumentParams struct {
 }
 
 func (cli *LSPClient) DidOpen(ctx context.Context, file DocumentURI) (*TextDocumentItem, error) {
+	// 先尝试读取缓存
+	cli.filesMu.RLock()
 	if f, ok := cli.files[file]; ok {
+		cli.filesMu.RUnlock()
 		return f, nil
 	}
+	cli.filesMu.RUnlock()
+
 	text, err := os.ReadFile(file.File())
 	if err != nil {
 		return nil, err
@@ -53,7 +58,12 @@ func (cli *LSPClient) DidOpen(ctx context.Context, file DocumentURI) (*TextDocum
 		Text:       string(text),
 		LineCounts: utils.CountLines(string(text)),
 	}
+
+	// 写入缓存
+	cli.filesMu.Lock()
 	cli.files[file] = f
+	cli.filesMu.Unlock()
+
 	req := DidOpenTextDocumentParams{
 		TextDocument: *f,
 	}
@@ -247,7 +257,10 @@ func (cli *LSPClient) TypeDefinition(ctx context.Context, uri DocumentURI, pos P
 
 // read file and get the text of block of range
 func (cli *LSPClient) Locate(id Location) (string, error) {
+	cli.filesMu.RLock()
 	f, ok := cli.files[id.URI]
+	cli.filesMu.RUnlock()
+
 	if !ok {
 		// open file os
 		fd, err := os.ReadFile(id.URI.File())
@@ -262,7 +275,10 @@ func (cli *LSPClient) Locate(id Location) (string, error) {
 			Text:       text,
 			LineCounts: utils.CountLines(text),
 		}
+
+		cli.filesMu.Lock()
 		cli.files[id.URI] = f
+		cli.filesMu.Unlock()
 	}
 
 	text := f.Text
@@ -274,7 +290,10 @@ func (cli *LSPClient) Locate(id Location) (string, error) {
 
 // get line text of pos
 func (cli *LSPClient) Line(uri DocumentURI, pos int) string {
+	cli.filesMu.RLock()
 	f, ok := cli.files[uri]
+	cli.filesMu.RUnlock()
+
 	if !ok {
 		// open file os
 		fd, err := os.ReadFile(uri.File())
@@ -289,7 +308,10 @@ func (cli *LSPClient) Line(uri DocumentURI, pos int) string {
 			Text:       text,
 			LineCounts: utils.CountLines(text),
 		}
+
+		cli.filesMu.Lock()
 		cli.files[uri] = f
+		cli.filesMu.Unlock()
 	}
 	if pos < 0 || pos >= len(f.LineCounts) {
 		return ""
@@ -303,7 +325,10 @@ func (cli *LSPClient) Line(uri DocumentURI, pos int) string {
 }
 
 func (cli *LSPClient) LineCounts(uri DocumentURI) []int {
+	cli.filesMu.RLock()
 	f, ok := cli.files[uri]
+	cli.filesMu.RUnlock()
+
 	if !ok {
 		// open file os
 		fd, err := os.ReadFile(uri.File())
@@ -318,12 +343,17 @@ func (cli *LSPClient) LineCounts(uri DocumentURI) []int {
 			Text:       text,
 			LineCounts: utils.CountLines(text),
 		}
+
+		cli.filesMu.Lock()
 		cli.files[uri] = f
+		cli.filesMu.Unlock()
 	}
 	return f.LineCounts
 }
 
 func (cli *LSPClient) GetFile(uri DocumentURI) *TextDocumentItem {
+	cli.filesMu.RLock()
+	defer cli.filesMu.RUnlock()
 	return cli.files[uri]
 }
 
@@ -331,7 +361,12 @@ func (cli *LSPClient) GetParent(sym *DocumentSymbol) (ret *DocumentSymbol) {
 	if sym == nil {
 		return nil
 	}
-	if f, ok := cli.files[sym.Location.URI]; ok {
+
+	cli.filesMu.RLock()
+	f, ok := cli.files[sym.Location.URI]
+	cli.filesMu.RUnlock()
+
+	if ok {
 		for _, s := range f.Symbols {
 			if s != sym && s.Location.Range.Include(sym.Location.Range) {
 				if ret == nil || ret.Location.Range.Include(s.Location.Range) {
