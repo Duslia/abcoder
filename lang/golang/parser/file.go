@@ -505,6 +505,8 @@ func (p *GoParser) parseFunc(ctx *fileContext, funcDecl *ast.FuncDecl) (*Functio
 		ctx.collectFields(funcDecl.Type.TypeParams.List, &tparams)
 	}
 
+	fmt.Printf("filepath: %s, funcname: %s\n", ctx.filePath, fname)
+
 	// collect signature
 	sig := ctx.GetRawContent(funcDecl.Type)
 
