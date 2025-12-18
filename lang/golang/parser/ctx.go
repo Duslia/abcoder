@@ -210,6 +210,13 @@ func (ctx *fileContext) GetRawContent(node ast.Node) []byte {
 }
 
 func GetRawContent(fset *token.FileSet, file []byte, node ast.Node, collectComment bool) []byte {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Fprintf(os.Stderr, "GetRawContent panic: %v\n", err)
+			fmt.Printf("filename: %s\n", fset.Position(node.Pos()).Filename)
+			fmt.Printf("file content: %s\n", file)
+		}
+	}()
 	var doc = bytes.Buffer{}
 	switch v := node.(type) {
 	case *ast.Field:

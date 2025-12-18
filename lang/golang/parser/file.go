@@ -30,6 +30,15 @@ func (p *GoParser) parseFile(ctx *fileContext, f *ast.File) error {
 	cont := true
 	ast.Inspect(f, func(node ast.Node) bool {
 		if funcDecl, ok := node.(*ast.FuncDecl); ok {
+			fname := funcDecl.Name.Name
+			// ignore cgo function
+			if strings.HasPrefix(fname, "_Cgo") ||
+				strings.HasPrefix(fname, "_cgo") ||
+				strings.HasPrefix(fname, "_cgoexp") ||
+				strings.HasPrefix(fname, "_Cfunc") {
+				return true
+			}
+
 			// parse funcs
 			_, ct := p.parseFunc(ctx, funcDecl)
 			// fileFuncs[f.Name] = f
