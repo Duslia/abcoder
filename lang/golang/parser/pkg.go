@@ -185,6 +185,9 @@ func (p *GoParser) loadPackages(mod *Module, dir string, pkgPath PkgPath) (err e
 		Mode: baseOpts,
 		Fset: fset,
 		Dir:  dir,
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(os.Stdout, format, args...)
+		},
 	}
 
 	if p.opts.NeedTest {
